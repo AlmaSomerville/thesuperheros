@@ -2,6 +2,7 @@
    Juntos 📞 — core app
    - PeerJS signaling (free public server), WebRTC P2P media
    - Dual "hang up together" button
+   - Robust connect: retry loop, ghost-host recovery, auto-reconnect
    - Game framework (games register themselves from games.js)
    ============================================================ */
 
@@ -20,6 +21,38 @@ function switchView(id) {
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
   $(id).classList.add("active");
 }
+
+// ============================================================
+// ⚠️ TURN SERVER — IMPORTANT FOR MOBILE DATA (4G/5G) CALLS
+// Wi-Fi ↔ Wi-Fi usually works with STUN alone, but phone-to-phone
+// on mobile data almost always needs a TURN relay.
+// Get FREE credentials (50 GB/month) in ~2 minutes:
+//   1. Sign up at https://dashboard.metered.ca/signup
+//   2. Create a "TURN credential" → copy username + credential
+//   3. Paste them below. That's it.
+// ============================================================
+const TURN_USERNAME = "";   // ← paste here
+const TURN_CREDENTIAL = ""; // ← paste here
+
+const ICE = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    ...(TURN_USERNAME && TURN_CREDENTIAL
+      ? [
+          { urls: "turn:global.relay.metered.ca:80", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+          { urls: "turn:global.relay.metered.ca:80?transport=tcp", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+          { urls: "turn:global.relay.metered.ca:443", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+          { urls: "turns:global.relay.metered.ca:443?transport=tcp", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+        ]
+      : [
+          // Fallback public relay — often overloaded/unreliable.
+          // Really do grab your own free credentials above.
+          { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+          { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+        ]),
+  ],
+};
 
 // ---------- i18n ----------
 const I18N = {
@@ -43,11 +76,12 @@ const I18N = {
     needName: "Escribe tu nombre 😊",
     needRoom: "Escribe el nombre de la sala 😊",
     connecting: "Conectando…",
+    retrying: (n) => `Conectando… (intento ${n})`,
+    reconnecting: "Se cortó la llamada. Reconectando… 🔄",
     linkCopied: "¡Enlace copiado! Envíaselo 📨",
     theyWantHangup: (n) => `${n} quiere colgar 👋 ¡Pulsa tú también el botón rojo para despediros!`,
     waitingHangup: (n) => `Esperamos a que ${n} también pulse Colgar… ¡chocaréis las manos! 🙌`,
     hangupCancelled: "¡Seguimos! 🎉",
-    friendLeft: "Se cortó la llamada 😮 Podéis volver a entrar en la misma sala.",
     camError: "No puedo abrir la cámara. Revisa los permisos del navegador 🎥",
     connError: "No me puedo conectar. Probad a entrar otra vez.",
     friend: "Amigo",
@@ -75,11 +109,12 @@ const I18N = {
     needName: "Type your name 😊",
     needRoom: "Type the room name 😊",
     connecting: "Connecting…",
+    retrying: (n) => `Connecting… (attempt ${n})`,
+    reconnecting: "The call dropped. Reconnecting… 🔄",
     linkCopied: "Link copied! Send it over 📨",
     theyWantHangup: (n) => `${n} wants to hang up 👋 Press the red button too so you can say bye together!`,
     waitingHangup: (n) => `Waiting for ${n} to press Hang up too… then you high-five! 🙌`,
     hangupCancelled: "We keep going! 🎉",
-    friendLeft: "The call dropped 😮 You can both re-enter the same room.",
     camError: "Can't open the camera. Check browser permissions 🎥",
     connError: "Can't connect. Try joining again.",
     friend: "Friend",
@@ -111,27 +146,19 @@ const S = {
   myName: localStorage.getItem("juntos-name") || "",
   room: "",
   peer: null,
-  conn: null,        // data connection
-  call: null,        // media call
+  conn: null,
+  call: null,
   localStream: null,
   remoteName: "",
   isHost: false,
   inCall: false,
+  closing: false,       // user intentionally left → stop all retries
   myEndPressed: false,
   theirEndPressed: false,
   hangupTimer: null,
-  currentGame: null, // active game object
-};
-
-const ICE = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    // Free public TURN relay (helps on strict mobile networks).
-    // For your own TURN credentials see README → "If video won't connect".
-    { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
-    { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
-  ],
+  retryTimer: null,
+  watchdogTimer: null,
+  currentGame: null,
 };
 
 const roomToId = (room) =>
@@ -170,59 +197,87 @@ $("btn-share").onclick = async () => {
 $("btn-cancel-wait").onclick = () => cleanup(true);
 $("btn-bye-home").onclick = () => switchView("view-home");
 
-// ---------- session ----------
+// Release our peer ID cleanly when the page closes — this is what
+// prevents "ghost" hosts from blocking the room on the next join.
+window.addEventListener("pagehide", () => { try { S.peer && S.peer.destroy(); } catch (_) {} });
+window.addEventListener("beforeunload", () => { try { S.peer && S.peer.destroy(); } catch (_) {} });
+
+// ---------- session / connection state machine ----------
 async function startSession() {
   switchView("view-wait");
   $("wait-room-code").textContent = S.room;
   $("wait-status").textContent = t("connecting");
 
-  // camera + mic first (user gesture context)
-  try {
-    S.localStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 720 } },
-      audio: { echoCancellation: true, noiseSuppression: true },
-    });
-  } catch (e) {
-    toast(t("camError"), 4000);
-    switchView("view-home");
-    return;
+  if (!S.localStream) {
+    try {
+      S.localStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 720 } },
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+    } catch (e) {
+      toast(t("camError"), 4000);
+      switchView("view-home");
+      return;
+    }
+    $("local-video").srcObject = S.localStream;
   }
-  $("local-video").srcObject = S.localStream;
-
-  // Try to become the host by claiming the room's peer id.
-  const hostId = roomToId(S.room);
-  tryHost(hostId);
+  S.closing = false;
+  attemptConnect(1);
 }
 
-function tryHost(hostId) {
-  S.isHost = true;
+function destroyPeer() {
+  clearTimeout(S.watchdogTimer);
+  try { S.call && S.call.close(); } catch (_) {}
+  try { S.conn && S.conn.close(); } catch (_) {}
+  try { S.peer && S.peer.destroy(); } catch (_) {}
+  S.peer = S.conn = S.call = null;
+}
+
+function attemptConnect(n) {
+  if (S.closing) return;
+  destroyPeer();
+  if (n > 1) $("wait-status").textContent = t("retrying", n);
+
+  const hostId = roomToId(S.room);
   const peer = new Peer(hostId, { config: ICE });
   S.peer = peer;
+  let decided = false;
 
   peer.on("open", () => {
+    if (decided) return;
+    decided = true;
+    S.isHost = true;
     $("wait-status").textContent = "";
-    peer.on("connection", (conn) => setupConn(conn));
-    peer.on("call", (call) => {
-      S.call = call;
-      call.answer(S.localStream);
-      wireCall(call);
-    });
+    hostMode(peer);
   });
-
   peer.on("error", (err) => {
     if (err.type === "unavailable-id") {
-      // Someone already opened the room — we join as guest.
-      peer.destroy();
-      becomeGuest(hostId);
+      // Room already has a host (real — or a ghost from a closed tab).
+      if (!decided) { decided = true; guestMode(hostId, n); }
     } else {
-      handlePeerError(err);
+      scheduleRetry(n, err);
     }
   });
-  peer.on("disconnected", () => peer.reconnect());
+  peer.on("disconnected", () => { try { peer.reconnect(); } catch (_) {} });
 }
 
-function becomeGuest(hostId) {
-  S.isHost = false;
+function hostMode(peer) {
+  S.isHost = true;
+  peer.on("connection", (conn) => {
+    // A newer guest connection always replaces the old one
+    try { S.conn && S.conn.close(); } catch (_) {}
+    setupConn(conn);
+  });
+  peer.on("call", (call) => {
+    try { S.call && S.call.close(); } catch (_) {}
+    S.call = call;
+    call.answer(S.localStream);
+    wireCall(call);
+  });
+}
+
+function guestMode(hostId, n) {
+  destroyPeer();
   const peer = new Peer({ config: ICE });
   S.peer = peer;
 
@@ -232,23 +287,33 @@ function becomeGuest(hostId) {
     const call = peer.call(hostId, S.localStream);
     S.call = call;
     wireCall(call);
+    // Watchdog: if no video arrives, the "host" may be a ghost or the
+    // network path failed — tear down and retry. Ghost IDs expire on the
+    // signaling server within ~1 minute, after which we claim host.
+    clearTimeout(S.watchdogTimer);
+    S.watchdogTimer = setTimeout(() => {
+      if (!S.inCall && !S.closing) scheduleRetry(n);
+    }, 12000);
   });
-  peer.on("error", handlePeerError);
-  peer.on("disconnected", () => peer.reconnect());
+  peer.on("error", (err) => {
+    if (err.type === "peer-unavailable") scheduleRetry(n); // ghost just expired
+    else scheduleRetry(n, err);
+  });
+  peer.on("disconnected", () => { try { peer.reconnect(); } catch (_) {} });
 }
 
-function handlePeerError(err) {
-  console.warn("peer error", err);
-  if (["peer-unavailable", "network", "server-error", "socket-error"].includes(err.type)) {
-    toast(t("connError"), 4000);
-  }
+function scheduleRetry(n, err) {
+  if (S.closing || S.inCall) return;
+  if (err) console.warn("retrying after peer error:", err.type || err);
+  destroyPeer();
+  clearTimeout(S.retryTimer);
+  const delay = Math.min(1500 + n * 800, 5000);
+  S.retryTimer = setTimeout(() => attemptConnect(n + 1), delay);
 }
 
 function setupConn(conn) {
   S.conn = conn;
-  conn.on("open", () => {
-    send({ t: "hello", name: S.myName });
-  });
+  conn.on("open", () => send({ t: "hello", name: S.myName }));
   conn.on("data", onMessage);
   conn.on("close", onPeerGone);
   conn.on("error", (e) => console.warn("conn error", e));
@@ -266,17 +331,27 @@ function wireCall(call) {
 function enterCall() {
   if (S.inCall) return;
   S.inCall = true;
+  clearTimeout(S.watchdogTimer);
+  clearTimeout(S.retryTimer);
+  resetHangupState();
   $("local-name").textContent = S.myName;
   $("remote-name").textContent = S.remoteName || t("friend");
   switchView("view-call");
 }
 
+// Other side vanished (closed tab, lost network) — auto-reconnect.
 function onPeerGone() {
-  if (!S.inCall) return;
-  // If we're mid-goodbye this is expected.
-  if (S.myEndPressed && S.theirEndPressed) return;
-  toast(t("friendLeft"), 4000);
-  cleanup(true);
+  if (S.closing) return;
+  if (S.myEndPressed && S.theirEndPressed) return; // normal goodbye
+  if (!S.inCall) return; // pre-call churn is handled by the retry loop
+  S.inCall = false;
+  endGame();
+  resetHangupState();
+  $("remote-video").srcObject = null;
+  toast(t("reconnecting"), 3500);
+  switchView("view-wait");
+  $("wait-status").textContent = t("reconnecting");
+  scheduleRetry(0);
 }
 
 function send(obj) {
@@ -298,7 +373,6 @@ function onMessage(msg) {
       onGameMsg(msg);
       break;
     default:
-      // per-game messages route to the active game
       if (S.currentGame && S.currentGame.onMessage) S.currentGame.onMessage(msg);
   }
 }
@@ -345,12 +419,20 @@ function onHangupMsg(msg) {
   }
 }
 
+function resetHangupState() {
+  S.myEndPressed = false;
+  S.theirEndPressed = false;
+  clearTimeout(S.hangupTimer);
+  hide($("hangup-banner"));
+  hide($("hangup-wait"));
+  $("btn-end").classList.remove("pulse");
+}
+
 function refreshHangupUI() {
   const banner = $("hangup-banner");
   const waitBox = $("hangup-wait");
   const endBtn = $("btn-end");
 
-  // Other side pressed, I haven't → big invitation banner + pulsing red button
   if (S.theirEndPressed && !S.myEndPressed) {
     $("hangup-banner-text").textContent = t("theyWantHangup", S.remoteName || t("friend"));
     show(banner);
@@ -360,13 +442,11 @@ function refreshHangupUI() {
     endBtn.classList.remove("pulse");
   }
 
-  // I pressed, waiting for them → waiting box with cancel
   if (S.myEndPressed && !S.theirEndPressed) {
     $("hangup-wait-text").textContent = t("waitingHangup", S.remoteName || t("friend"));
     show(waitBox);
     clearTimeout(S.hangupTimer);
     S.hangupTimer = setTimeout(() => {
-      // auto-cancel after 25s so nobody gets stuck
       if (S.myEndPressed && !S.theirEndPressed) $("btn-hangup-cancel").click();
     }, 25000);
   } else {
@@ -377,33 +457,29 @@ function refreshHangupUI() {
 
 function maybeFinishHangup() {
   if (!(S.myEndPressed && S.theirEndPressed)) return;
-  // Goodbye ritual 🙌
   switchView("view-bye");
   setTimeout(() => cleanup(false), 400);
 }
 
 function cleanup(goHome) {
-  try { S.call && S.call.close(); } catch (_) {}
-  try { S.conn && S.conn.close(); } catch (_) {}
-  try { S.peer && S.peer.destroy(); } catch (_) {}
+  S.closing = true;
+  clearTimeout(S.retryTimer);
+  clearTimeout(S.watchdogTimer);
+  destroyPeer();
   try { S.localStream && S.localStream.getTracks().forEach((tr) => tr.stop()); } catch (_) {}
   $("remote-video").srcObject = null;
   $("local-video").srcObject = null;
   Object.assign(S, {
-    peer: null, conn: null, call: null, localStream: null,
-    inCall: false, myEndPressed: false, theirEndPressed: false, currentGame: null,
+    localStream: null, inCall: false, currentGame: null, remoteName: "",
   });
+  resetHangupState();
   document.body.classList.remove("in-game");
   $("game-area").innerHTML = "";
-  hide($("hangup-banner"));
-  hide($("hangup-wait"));
   hide($("games-drawer"));
-  $("btn-end").classList.remove("pulse");
   if (goHome) switchView("view-home");
 }
 
 // ---------- game framework ----------
-// games.js pushes into GAMES: { id, emoji, name:{es,en}, color, start(payload, initiator), onMessage(msg) }
 const GAMES = [];
 window.JUNTOS = { GAMES, S, send, t, toast, $, snapshot, endGame, launchGame, langRef: () => lang };
 
@@ -442,7 +518,6 @@ function launchGame(id, iAmInitiator, payload) {
   const area = $("game-area");
   area.innerHTML = "";
 
-  // quit button
   const quit = document.createElement("button");
   quit.className = "game-quit";
   quit.textContent = "✖";
@@ -474,7 +549,6 @@ function endGame() {
 }
 
 // ---------- shared snapshot helper ----------
-// which: "remote" | "local" → returns dataURL jpeg
 function snapshot(which) {
   const video = $(which === "remote" ? "remote-video" : "local-video");
   const w = 480;
@@ -483,7 +557,7 @@ function snapshot(which) {
   const c = document.createElement("canvas");
   c.width = w; c.height = h;
   const ctx = c.getContext("2d");
-  if (which === "local") { // mirror selfies like the preview
+  if (which === "local") {
     ctx.translate(w, 0); ctx.scale(-1, 1);
   }
   ctx.drawImage(video, 0, 0, w, h);
