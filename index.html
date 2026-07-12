@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0B3B44">
+<title>Juntos 📞 · Videollamadas con juegos</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,700;12..96,800&family=Nunito:wght@500;700;800;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📞</text></svg>">
+</head>
+<body>
+
+<!-- ============ HOME ============ -->
+<section id="view-home" class="view active">
+  <button id="lang-toggle" class="chip" type="button">EN</button>
+  <div class="home-inner">
+    <div class="logo-bubble">📞</div>
+    <h1 class="logo-word">Juntos</h1>
+    <p class="tagline" data-i18n="tagline">Videollamadas con juegos, para nosotros dos</p>
+
+    <label class="field">
+      <span data-i18n="yourName">¿Cómo te llamas?</span>
+      <input id="name-input" type="text" maxlength="14" autocomplete="off" placeholder="…">
+    </label>
+
+    <label class="field">
+      <span data-i18n="roomCode">Nombre secreto de la sala</span>
+      <input id="room-input" type="text" maxlength="24" autocomplete="off" placeholder="dragon-azul">
+    </label>
+
+    <button id="btn-join" class="btn btn-big btn-green" type="button">
+      <span class="btn-emoji">🚀</span><span data-i18n="enterCall">Entrar a la llamada</span>
+    </button>
+    <p class="hint" data-i18n="homeHint">Los dos tenéis que escribir el mismo nombre de sala. El primero que entra abre la sala; el otro se une.</p>
+  </div>
+</section>
+
+<!-- ============ WAITING ============ -->
+<section id="view-wait" class="view">
+  <div class="wait-inner">
+    <div class="wait-anim"><span>📡</span></div>
+    <h2 id="wait-title" data-i18n="waiting">Esperando al otro lado…</h2>
+    <p class="wait-room"><span data-i18n="room">Sala</span>: <b id="wait-room-code"></b></p>
+    <button id="btn-share" class="btn btn-amber" type="button">
+      <span class="btn-emoji">🔗</span><span data-i18n="shareLink">Compartir enlace</span>
+    </button>
+    <button id="btn-cancel-wait" class="btn btn-ghost" type="button" data-i18n="back">Volver</button>
+    <p id="wait-status" class="hint"></p>
+  </div>
+</section>
+
+<!-- ============ CALL ============ -->
+<section id="view-call" class="view">
+  <div id="videos" class="videos">
+    <div class="video-wrap remote">
+      <video id="remote-video" autoplay playsinline></video>
+      <span id="remote-name" class="video-label"></span>
+    </div>
+    <div class="video-wrap local">
+      <video id="local-video" autoplay playsinline muted></video>
+      <span id="local-name" class="video-label"></span>
+    </div>
+  </div>
+
+  <!-- game area (hidden until a game starts) -->
+  <div id="game-area" class="game-area"></div>
+
+  <!-- hangup banner when the OTHER side pressed -->
+  <div id="hangup-banner" class="hangup-banner hidden">
+    <span id="hangup-banner-text"></span>
+  </div>
+
+  <!-- bottom controls -->
+  <div class="callbar">
+    <button id="btn-mic" class="ctrl" type="button" title="Micro">🎤</button>
+    <button id="btn-cam" class="ctrl" type="button" title="Cámara">🎥</button>
+    <button id="btn-games" class="ctrl ctrl-games" type="button" title="Juegos">🎮</button>
+    <button id="btn-end" class="ctrl ctrl-end" type="button">
+      <span id="btn-end-icon">📞</span><span id="btn-end-label" data-i18n="endCall">Colgar</span>
+    </button>
+  </div>
+
+  <!-- my hangup pending state -->
+  <div id="hangup-wait" class="hangup-wait hidden">
+    <p id="hangup-wait-text"></p>
+    <button id="btn-hangup-cancel" class="btn btn-ghost" type="button" data-i18n="keepTalking">¡Seguimos hablando!</button>
+  </div>
+
+  <!-- games drawer -->
+  <div id="games-drawer" class="games-drawer hidden">
+    <h3 data-i18n="pickGame">¿A qué jugamos?</h3>
+    <div class="games-grid" id="games-grid"></div>
+    <button id="btn-close-drawer" class="btn btn-ghost" type="button" data-i18n="close">Cerrar</button>
+  </div>
+</section>
+
+<!-- ============ GOODBYE ============ -->
+<section id="view-bye" class="view">
+  <div class="bye-inner">
+    <div class="bye-hands"><span class="hand-l">🫸</span><span class="hand-r">🫷</span><span class="hand-hi">🙌</span></div>
+    <h2 data-i18n="byeTitle">¡Chocadas!</h2>
+    <p data-i18n="byeText">Hasta muy pronto 👋💛</p>
+    <button id="btn-bye-home" class="btn btn-amber" type="button" data-i18n="backHome">Volver al inicio</button>
+  </div>
+</section>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="app.js"></script>
+<script src="games.js"></script>
+</body>
+</html>
